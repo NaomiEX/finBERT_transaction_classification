@@ -10,6 +10,7 @@ from tqdm import tqdm_notebook as tqdm
 from tqdm import trange
 from nltk.tokenize import sent_tokenize
 from finbert.utils import *
+from finbert.transaction_classification import TransactionsProcessor
 import numpy as np
 import logging
 
@@ -120,7 +121,7 @@ class FinBert(object):
                  config):
         self.config = config
 
-    def prepare_model(self, label_list):
+    def prepare_model(self, label_list, transaction_classification=True):
         """
         Sets some of the components of the model: Dataset processor, number of labels, usage of gpu and distributed
         training, gradient accumulation steps and tokenizer.
@@ -131,7 +132,7 @@ class FinBert(object):
         """
 
         self.processors = {
-            "finsent": FinSentProcessor
+            "finsent": TransactionsProcessor if transaction_classification else FinSentProcessor
         }
 
         self.num_labels_task = {
@@ -147,6 +148,7 @@ class FinBert(object):
             self.n_gpu = 1
             # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
             torch.distributed.init_process_group(backend='nccl')
+
         logger.info("device: {} n_gpu: {}, distributed training: {}, 16-bits training: {}".format(
             self.device, self.n_gpu, bool(self.config.local_rank != -1), self.config.fp16))
 
@@ -171,10 +173,11 @@ class FinBert(object):
         self.processor = self.processors['finsent']()
         self.num_labels = len(label_list)
         self.label_list = label_list
+        self.base_model = self.config.base_model
 
         self.tokenizer = AutoTokenizer.from_pretrained(self.base_model, do_lower_case=self.config.do_lower_case)
 
-    def get_data(self, phase):
+    def get_data(self, phase, label_colname="label"):
         """
         Gets the data for training or evaluation. It returns the data in the format that pytorch will process. In the
         data directory, there should be a .csv file with the name <phase>.csv
@@ -198,11 +201,11 @@ class FinBert(object):
                 examples) / self.config.train_batch_size / self.config.gradient_accumulation_steps) * self.config.num_train_epochs
 
         if phase == 'train':
-            train = pd.read_csv(os.path.join(self.config.data_dir, 'train.csv'), sep='\t', index_col=False)
+            # train = pd.read_csv(os.path.join(self.config.data_dir, 'train.csv'), sep='\t', index_col=False)
+            train = pd.read_csv(os.path.join(self.config.data_dir, 'train.csv'))
             weights = list()
             labels = self.label_list
-
-            class_weights = [train.shape[0] / train[train.label == label].shape[0] for label in labels]
+            class_weights = [train.shape[0] / train[train[label_colname] == label].shape[0] for label in labels]
             self.class_weights = torch.tensor(class_weights)
 
         return examples
