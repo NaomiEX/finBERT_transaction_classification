@@ -533,7 +533,7 @@ class FinBert(object):
         os.remove(self.config.model_dir / ('temporary' + str(best_model)))
         return model
 
-    def evaluate(self, model, examples):
+    def evaluate(self, model, examples, numeric_features=None):
         """
         Evaluate the model.
         Parameters
@@ -548,7 +548,7 @@ class FinBert(object):
             A dataframe that includes for each example predicted probability and labels.
         """
 
-        eval_loader = self.get_loader(examples, phase='eval')
+        eval_loader = self.get_loader(examples, phase='eval', numeric_features=numeric_features)
 
         logger.info("***** Running evaluation ***** ")
         logger.info("  Num examples = %d", len(examples))
@@ -563,7 +563,10 @@ class FinBert(object):
         agree_levels = []
         text_ids = []
 
-        for input_ids, attention_mask, token_type_ids, label_ids, agree_ids in tqdm(eval_loader, desc="Testing"):
+        for batch in tqdm(eval_loader, desc="Testing"):
+            input_ids, attention_mask, token_type_ids, label_ids, agree_ids, *numeric_feats = batch
+            if self.transaction_classification:
+                numeric_feats = numeric_feats[0].to(self.device)
             input_ids = input_ids.to(self.device)
             attention_mask = attention_mask.to(self.device)
             token_type_ids = token_type_ids.to(self.device)
@@ -571,7 +574,10 @@ class FinBert(object):
             agree_ids = agree_ids.to(self.device)
 
             with torch.no_grad():
-                logits = model(input_ids, attention_mask, token_type_ids)[0]
+                if self.transaction_classification:
+                    logits = model(input_ids, attention_mask, token_type_ids, numeric_feats)
+                else:
+                    logits = model(input_ids, attention_mask, token_type_ids)[0]
 
                 if self.config.output_mode == "classification":
                     loss_fct = CrossEntropyLoss()
