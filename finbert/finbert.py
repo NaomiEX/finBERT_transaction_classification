@@ -3,7 +3,7 @@ from __future__ import absolute_import, division, print_function
 import random
 
 import pandas as pd
-from torch.nn import MSELoss, CrossEntropyLoss
+from torch.nn import MSELoss, CrossEntropyLoss, Linear, Identity
 from torch.utils.data import (DataLoader, RandomSampler, SequentialSampler,
     TensorDataset)
 from tqdm import tqdm_notebook as tqdm
@@ -44,7 +44,11 @@ class Config(object):
                  discriminate=True,
                  gradual_unfreeze=True,
                  encoder_no=12,
-                 base_model='bert-base-uncased'):
+                 base_model='bert-base-uncased',
+                 ## custom params
+                 numeric_params=38,
+                 label_colname="category"
+                 ):
         """
         Parameters
         ----------
@@ -110,7 +114,8 @@ class Config(object):
         self.gradual_unfreeze = gradual_unfreeze
         self.encoder_no = encoder_no
         self.base_model = base_model
-
+        self.numeric_params=numeric_params
+        self.label_colname = label_colname
 
 class FinBert(object):
     """
@@ -118,10 +123,12 @@ class FinBert(object):
     """
 
     def __init__(self,
-                 config):
+                 config,
+                 transaction_classification=False):
         self.config = config
+        self.transaction_classification=transaction_classification
 
-    def prepare_model(self, label_list, transaction_classification=True):
+    def prepare_model(self, label_list):
         """
         Sets some of the components of the model: Dataset processor, number of labels, usage of gpu and distributed
         training, gradient accumulation steps and tokenizer.
@@ -132,7 +139,7 @@ class FinBert(object):
         """
 
         self.processors = {
-            "finsent": TransactionsProcessor if transaction_classification else FinSentProcessor
+            "finsent": TransactionsProcessor if self.transaction_classification else FinSentProcessor
         }
 
         self.num_labels_task = {
@@ -177,7 +184,7 @@ class FinBert(object):
 
         self.tokenizer = AutoTokenizer.from_pretrained(self.base_model, do_lower_case=self.config.do_lower_case)
 
-    def get_data(self, phase, label_colname="label"):
+    def get_data(self, phase):
         """
         Gets the data for training or evaluation. It returns the data in the format that pytorch will process. In the
         data directory, there should be a .csv file with the name <phase>.csv
@@ -197,18 +204,20 @@ class FinBert(object):
         examples = None
         examples = self.processor.get_examples(self.config.data_dir, phase)
         self.num_train_optimization_steps = int(
-            len(
-                examples) / self.config.train_batch_size / self.config.gradient_accumulation_steps) * self.config.num_train_epochs
+            len(examples) / self.config.train_batch_size / self.config.gradient_accumulation_steps) * self.config.num_train_epochs
 
         if phase == 'train':
             # train = pd.read_csv(os.path.join(self.config.data_dir, 'train.csv'), sep='\t', index_col=False)
             train = pd.read_csv(os.path.join(self.config.data_dir, 'train.csv'))
             weights = list()
             labels = self.label_list
-            class_weights = [train.shape[0] / train[train[label_colname] == label].shape[0] for label in labels]
+            class_weights = [train.shape[0] / train[train[self.config.label_colname] == label].shape[0] for label in labels]
             self.class_weights = torch.tensor(class_weights)
-
-        return examples
+        if self.transaction_classification:
+            numeric_feats = self.processor.get_numeric(self.config.data_dir, phase)
+            return examples, numeric_feats
+        else:
+            return examples
 
     def create_the_model(self):
         """
@@ -260,8 +269,8 @@ class FinBert(object):
                             any(nd in n for nd in no_decay)],
                  'weight_decay': 0.0,
                  'lr': lr},
-                {'params': [p for n, p in list(model.classifier.named_parameters()) if
-                            not any(nd in n for nd in no_decay)],
+                {'params': [p for n, p in list(model.classifier.named_parameters()) 
+                            if not any(nd in n for nd in no_decay)],
                  'weight_decay': 0.01,
                  'lr': lr},
                 {'params': [p for n, p in list(model.classifier.named_parameters()) if any(nd in n for nd in no_decay)],
@@ -295,7 +304,7 @@ class FinBert(object):
 
         return model
 
-    def get_loader(self, examples, phase):
+    def get_loader(self, examples, phase, numeric_features=None):
         """
         Creates a data loader object for a dataset.
         Parameters
@@ -309,6 +318,8 @@ class FinBert(object):
         dataloader: DataLoader
             The data loader object.
         """
+        assert (self.transaction_classification and numeric_features is not None) or \
+               (self.transaction_classification == False and numeric_features is None)
 
         features = convert_examples_to_features(examples, self.label_list,
                                                 self.config.max_seq_length,
@@ -336,7 +347,10 @@ class FinBert(object):
         except:
             all_agree_ids = torch.tensor([0.0 for f in features], dtype=torch.long)
 
-        data = TensorDataset(all_input_ids, all_attention_mask, all_token_type_ids, all_label_ids, all_agree_ids)
+        if numeric_features is not None:
+            data = TensorDataset(all_input_ids, all_attention_mask, all_token_type_ids, all_label_ids, all_agree_ids, numeric_features.float())
+        else:
+            data = TensorDataset(all_input_ids, all_attention_mask, all_token_type_ids, all_label_ids, all_agree_ids)
 
         # Distributed, if necessary
         if phase == 'train':
@@ -347,7 +361,7 @@ class FinBert(object):
         dataloader = DataLoader(data, sampler=my_sampler, batch_size=self.config.train_batch_size)
         return dataloader
 
-    def train(self, train_examples, model):
+    def train(self, train_examples, model, train_numeric_feats=None):
         """
         Trains the model.
         Parameters
@@ -364,14 +378,18 @@ class FinBert(object):
             The trained model.
         """
 
-        validation_examples = self.get_data('validation')
+        if self.transaction_classification:
+            validation_examples, validation_numeric_feats = self.get_data('validation')
+        else:
+            validation_examples = self.get_data('validation')
 
         global_step = 0
 
         self.validation_losses = []
 
         # Training
-        train_dataloader = self.get_loader(train_examples, 'train')
+        train_dataloader = self.get_loader(
+            train_examples, 'train', numeric_features=train_numeric_feats if self.transaction_classification else None)
 
         model.train()
 
@@ -410,9 +428,14 @@ class FinBert(object):
 
                 batch = tuple(t.to(self.device) for t in batch)
 
-                input_ids, attention_mask, token_type_ids, label_ids, agree_ids = batch
+                if self.transaction_classification:
+                    input_ids, attention_mask, token_type_ids, label_ids, agree_ids, numeric_feats = batch
+                    logits = model(input_ids, attention_mask, token_type_ids, numeric_feats)
+                else:
+                    input_ids, attention_mask, token_type_ids, label_ids, agree_ids = batch
+                    logits = model(input_ids, attention_mask, token_type_ids)[0]
 
-                logits = model(input_ids, attention_mask, token_type_ids)[0]
+                
                 weights = self.class_weights.to(self.device)
 
                 if self.config.output_mode == "classification":
@@ -442,15 +465,24 @@ class FinBert(object):
                     self.optimizer.zero_grad()
                     global_step += 1
 
+                ## for monitoring
+                if step % 100 == 0:
+                  print(f"(Iteration {step}) Training loss: {loss.item()}")
+
             # Validation
 
-            validation_loader = self.get_loader(validation_examples, phase='eval')
+            validation_loader = self.get_loader(
+                validation_examples, phase='eval', numeric_features=validation_numeric_feats if self.transaction_classification else None)
             model.eval()
 
             valid_loss, valid_accuracy = 0, 0
             nb_valid_steps, nb_valid_examples = 0, 0
 
-            for input_ids, attention_mask, token_type_ids, label_ids, agree_ids in tqdm(validation_loader, desc="Validating"):
+            for batch in tqdm(validation_loader, desc="Validating"):
+                input_ids, attention_mask, token_type_ids, label_ids, agree_ids, *numeric_feats = batch
+                if self.transaction_classification:
+                    numeric_feats = numeric_feats[0]
+                    numeric_feats.to(self.device)
                 input_ids = input_ids.to(self.device)
                 attention_mask = attention_mask.to(self.device)
                 token_type_ids = token_type_ids.to(self.device)
@@ -458,7 +490,10 @@ class FinBert(object):
                 agree_ids = agree_ids.to(self.device)
 
                 with torch.no_grad():
-                    logits = model(input_ids, attention_mask, token_type_ids)[0]
+                    if self.transaction_classification:
+                        logits = model(input_ids, attention_mask, token_type_ids, numeric_feats)
+                    else:
+                        logits = model(input_ids, attention_mask, token_type_ids)[0]
 
                     if self.config.output_mode == "classification":
                         loss_fct = CrossEntropyLoss(weight=weights)
