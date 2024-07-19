@@ -404,7 +404,6 @@ class FinBert(object):
             nb_tr_examples, nb_tr_steps = 0, 0
 
             for step, batch in enumerate(tqdm(train_dataloader, desc='Iteration')):
-
                 if (self.config.gradual_unfreeze and i == 0):
                     for param in model.bert.parameters():
                         param.requires_grad = False
@@ -435,7 +434,6 @@ class FinBert(object):
                     input_ids, attention_mask, token_type_ids, label_ids, agree_ids = batch
                     logits = model(input_ids, attention_mask, token_type_ids)[0]
 
-                
                 weights = self.class_weights.to(self.device)
 
                 if self.config.output_mode == "classification":
@@ -477,12 +475,14 @@ class FinBert(object):
 
             valid_loss, valid_accuracy = 0, 0
             nb_valid_steps, nb_valid_examples = 0, 0
+            num_correct_preds, num_total = 0, 0
+            min_valid_accuracy = np.inf
 
             for batch in tqdm(validation_loader, desc="Validating"):
                 input_ids, attention_mask, token_type_ids, label_ids, agree_ids, *numeric_feats = batch
                 if self.transaction_classification:
                     numeric_feats = numeric_feats[0]
-                    numeric_feats.to(self.device)
+                    numeric_feats = numeric_feats.to(self.device)
                 input_ids = input_ids.to(self.device)
                 attention_mask = attention_mask.to(self.device)
                 token_type_ids = token_type_ids.to(self.device)
@@ -494,6 +494,12 @@ class FinBert(object):
                         logits = model(input_ids, attention_mask, token_type_ids, numeric_feats)
                     else:
                         logits = model(input_ids, attention_mask, token_type_ids)[0]
+                    np_logits = logits.view(-1, self.num_labels).cpu().numpy()
+
+                    preds = np.argmax(np_logits, axis=-1)
+                    correct_preds = preds == label_ids.view(-1).cpu().numpy()
+                    num_correct_preds += (correct_preds).sum()
+                    num_total += label_ids.view(-1).shape[0]
 
                     if self.config.output_mode == "classification":
                         loss_fct = CrossEntropyLoss(weight=weights)
@@ -510,9 +516,12 @@ class FinBert(object):
 
             self.validation_losses.append(valid_loss)
             print("Validation losses: {}".format(self.validation_losses))
+            accuracy = num_correct_preds / num_total
+            
+            print(f"Validation Accuracy: {accuracy:.4f}")
 
-            if valid_loss == min(self.validation_losses):
-
+            # if valid_loss == min(self.validation_losses):
+            if accuracy <= min_valid_accuracy:
                 try:
                     os.remove(self.config.model_dir / ('temporary' + str(best_model)))
                 except:
@@ -520,6 +529,7 @@ class FinBert(object):
                 torch.save({'epoch': str(i), 'state_dict': model.state_dict()},
                            self.config.model_dir / ('temporary' + str(i)))
                 best_model = i
+                min_valid_accuracy = accuracy
 
         # Save a trained model and the associated configuration
         checkpoint = torch.load(self.config.model_dir / ('temporary' + str(best_model)))
@@ -527,9 +537,9 @@ class FinBert(object):
         model_to_save = model.module if hasattr(model, 'module') else model  # Only save the model it-self
         output_model_file = os.path.join(self.config.model_dir, WEIGHTS_NAME)
         torch.save(model_to_save.state_dict(), output_model_file)
-        output_config_file = os.path.join(self.config.model_dir, CONFIG_NAME)
-        with open(output_config_file, 'w') as f:
-            f.write(model_to_save.config.to_json_string())
+        # output_config_file = os.path.join(self.config.model_dir, CONFIG_NAME)
+        # with open(output_config_file, 'w') as f:
+        #     f.write(model_to_save.config.to_json_string())
         os.remove(self.config.model_dir / ('temporary' + str(best_model)))
         return model
 
@@ -616,7 +626,8 @@ class FinBert(object):
 
             # eval_loss += tmp_eval_loss.mean().item()
             # eval_accuracy += tmp_eval_accuracy
-
+        eval_loss = eval_loss / nb_eval_steps
+        print("Evaluation loss:", eval_loss)
         evaluation_df = pd.DataFrame({'predictions': predictions, 'labels': labels, "agree_levels": agree_levels})
 
         return evaluation_df
