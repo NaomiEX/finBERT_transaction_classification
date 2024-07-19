@@ -124,9 +124,15 @@ class FinBert(object):
 
     def __init__(self,
                  config,
-                 transaction_classification=False):
+                 transaction_classification=False,
+                 use_numeric_feats=True):
         self.config = config
         self.transaction_classification=transaction_classification
+        self.use_numeric_feats = use_numeric_feats
+
+    @property
+    def transaction_numeric(self):
+        return self.transaction_classification and self.use_numeric_feats
 
     def prepare_model(self, label_list):
         """
@@ -213,7 +219,7 @@ class FinBert(object):
             labels = self.label_list
             class_weights = [train.shape[0] / train[train[self.config.label_colname] == label].shape[0] for label in labels]
             self.class_weights = torch.tensor(class_weights)
-        if self.transaction_classification:
+        if self.transaction_numeric:
             numeric_feats = self.processor.get_numeric(self.config.data_dir, phase)
             return examples, numeric_feats
         else:
@@ -318,8 +324,8 @@ class FinBert(object):
         dataloader: DataLoader
             The data loader object.
         """
-        assert (self.transaction_classification and numeric_features is not None) or \
-               (self.transaction_classification == False and numeric_features is None)
+        assert (self.transaction_numeric and numeric_features is not None) or \
+               ((self.transaction_classification == False or self.use_numeric_feats == False) and numeric_features is None)
 
         features = convert_examples_to_features(examples, self.label_list,
                                                 self.config.max_seq_length,
@@ -378,7 +384,7 @@ class FinBert(object):
             The trained model.
         """
 
-        if self.transaction_classification:
+        if self.transaction_numeric:
             validation_examples, validation_numeric_feats = self.get_data('validation')
         else:
             validation_examples = self.get_data('validation')
@@ -389,7 +395,7 @@ class FinBert(object):
 
         # Training
         train_dataloader = self.get_loader(
-            train_examples, 'train', numeric_features=train_numeric_feats if self.transaction_classification else None)
+            train_examples, 'train', numeric_features=train_numeric_feats if self.transaction_numeric else None)
 
         model.train()
 
@@ -427,7 +433,7 @@ class FinBert(object):
 
                 batch = tuple(t.to(self.device) for t in batch)
 
-                if self.transaction_classification:
+                if self.transaction_numeric:
                     input_ids, attention_mask, token_type_ids, label_ids, agree_ids, numeric_feats = batch
                     logits = model(input_ids, attention_mask, token_type_ids, numeric_feats)
                 else:
@@ -470,7 +476,7 @@ class FinBert(object):
             # Validation
 
             validation_loader = self.get_loader(
-                validation_examples, phase='eval', numeric_features=validation_numeric_feats if self.transaction_classification else None)
+                validation_examples, phase='eval', numeric_features=validation_numeric_feats if self.transaction_numeric else None)
             model.eval()
 
             valid_loss, valid_accuracy = 0, 0
@@ -480,7 +486,7 @@ class FinBert(object):
 
             for batch in tqdm(validation_loader, desc="Validating"):
                 input_ids, attention_mask, token_type_ids, label_ids, agree_ids, *numeric_feats = batch
-                if self.transaction_classification:
+                if self.transaction_numeric:
                     numeric_feats = numeric_feats[0]
                     numeric_feats = numeric_feats.to(self.device)
                 input_ids = input_ids.to(self.device)
@@ -490,7 +496,7 @@ class FinBert(object):
                 agree_ids = agree_ids.to(self.device)
 
                 with torch.no_grad():
-                    if self.transaction_classification:
+                    if self.transaction_numeric:
                         logits = model(input_ids, attention_mask, token_type_ids, numeric_feats)
                     else:
                         logits = model(input_ids, attention_mask, token_type_ids)[0]
@@ -575,7 +581,7 @@ class FinBert(object):
 
         for batch in tqdm(eval_loader, desc="Testing"):
             input_ids, attention_mask, token_type_ids, label_ids, agree_ids, *numeric_feats = batch
-            if self.transaction_classification:
+            if self.transaction_numeric:
                 numeric_feats = numeric_feats[0].to(self.device)
             input_ids = input_ids.to(self.device)
             attention_mask = attention_mask.to(self.device)
@@ -584,7 +590,7 @@ class FinBert(object):
             agree_ids = agree_ids.to(self.device)
 
             with torch.no_grad():
-                if self.transaction_classification:
+                if self.transaction_numeric:
                     logits = model(input_ids, attention_mask, token_type_ids, numeric_feats)
                 else:
                     logits = model(input_ids, attention_mask, token_type_ids)[0]
